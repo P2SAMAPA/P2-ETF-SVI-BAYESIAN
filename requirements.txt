@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+torch
+pyro-ppl
+huggingface-hub
+streamlit
+plotly
