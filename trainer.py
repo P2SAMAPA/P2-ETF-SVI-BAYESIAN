@@ -43,7 +43,7 @@ def main():
             all_results[universe_name] = {"top_etfs": []}
             continue
 
-        best_per_etf  = {}
+        best_per_etf   = {}
         window_results = {}
 
         for win in config.WINDOWS:
@@ -55,12 +55,14 @@ def main():
 
             ret_win = returns.iloc[-win:].values.astype(np.float32)
 
-            # Standardise: zero-mean, unit-variance per asset column
-            ret_win = (ret_win - ret_win.mean(axis=0)) / (ret_win.std(axis=0) + 1e-8)
+            # Standardise per asset column
+            col_std = ret_win.std(axis=0)
+            col_std[col_std < 1e-8] = 1.0            # avoid divide-by-zero on flat series
+            ret_win = (ret_win - ret_win.mean(axis=0)) / col_std
 
-            # FIX: clear Pyro param store between windows so AutoDiagonalNormal
-            # does not re-use stale variational parameters from the previous window,
-            # which causes shape mismatches when n_obs changes between windows.
+            # Clear Pyro param store between windows — AutoDiagonalNormal caches
+            # variational parameter shapes; stale shapes from a different window
+            # size (different N) cause shape mismatches on the next window.
             pyro.clear_param_store()
 
             try:
@@ -69,16 +71,16 @@ def main():
                     n_factors=config.N_FACTORS,
                     lr=config.LEARNING_RATE,
                     iterations=config.N_ITERATIONS,
-                    batch_size=config.BATCH_SIZE,
+                    # batch_size not used — model runs on full window
                 )
             except Exception as e:
                 print(f"  Window {win}d failed: {e}")
+                import traceback; traceback.print_exc()
                 continue
 
-            # Align scores to ticker names (ret_win columns = tickers order)
             available = [t for t in tickers if t in returns.columns]
             if len(scores) != len(available):
-                print(f"  Score/ticker length mismatch ({len(scores)} vs {len(available)}), skipping")
+                print(f"  Score/ticker mismatch ({len(scores)} vs {len(available)}), skipping")
                 continue
 
             score_dict = {available[i]: float(scores[i]) for i in range(len(available))}
@@ -112,10 +114,9 @@ def main():
             for ticker, (score, win) in sorted_etfs[:config.TOP_N]
         ]
 
-        print(f"  Top {config.TOP_N} ETFs by Bayesian SVI loading magnitude: "
-              f"{[e['ticker'] for e in top_etfs]}")
+        print(f"  Top {config.TOP_N} ETFs: {[e['ticker'] for e in top_etfs]}")
         for e in top_etfs:
-            print(f"    {e['ticker']}: {e['svi_score']:.6f}  (best window: {e['best_window']}d)")
+            print(f"    {e['ticker']}: {e['svi_score']:.6f}  (window: {e['best_window']}d)")
 
         all_results[universe_name] = {
             "top_etfs":       top_etfs,
@@ -124,7 +125,7 @@ def main():
             "run_date":       today,
         }
 
-    # ── Save & push results ───────────────────────────────────────────────────
+    # ── Save & push ───────────────────────────────────────────────────────────
     Path("results").mkdir(exist_ok=True)
     local_path = Path(f"results/svi_bayesian_{today}.json")
     with open(local_path, "w") as f:
