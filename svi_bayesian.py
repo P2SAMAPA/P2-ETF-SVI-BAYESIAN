@@ -50,6 +50,7 @@ def train_svi_model(X, n_factors=5, lr=0.01, iterations=500, batch_size=32):
     predictive = Predictive(model, guide=guide, num_samples=200, return_sites=["W"])
     with torch.no_grad():
         posterior = predictive(X_tensor, n_factors)
-    W_mean = posterior["W"].mean(dim=0).numpy()
-    scores  = np.sum(np.abs(W_mean), axis=1)
+    W_mean = posterior["W"].mean(dim=0).squeeze().numpy()  # remove any size-1 leading dims → (P, K)
+    scores  = np.abs(W_mean).sum(axis=-1).flatten()         # sum over K dim → (P,) always
+   
     return scores
