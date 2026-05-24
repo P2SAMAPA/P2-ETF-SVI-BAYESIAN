@@ -13,7 +13,7 @@ def model(X, n_factors):
     """
     Probabilistic factor model with ARD priors.
 
-    Shapes:  N = n_obs, P = n_assets, K = n_factors
+    Shapes:  N=n_obs, P=n_assets, K=n_factors
 
         alpha_k  ~ Gamma(1,1)               (K,)
         W_ik     ~ Normal(0, 1/sqrt(alpha))  (P, K)
@@ -21,14 +21,19 @@ def model(X, n_factors):
         tau      ~ Gamma(1,1)               scalar
         X_ni     ~ Normal(f @ W.T, 1/√tau)  (N, P)
 
-    FIX: AutoDiagonalNormal injects an extra leading sample dimension when
-    it calls the model during Predictive.  alpha arrives as shape (..., K)
-    where ... may be (1,) or (num_samples,).  We must squeeze/reshape alpha
-    to exactly (K,) before broadcasting it into the W prior scale, otherwise
-    `.expand([n_assets, n_factors])` receives a 3-D tensor with only 2
-    target dims and raises:
-        "expand(FloatTensor{[1,1,5]}, size=[7,5]): number of sizes provided
-         (2) must be >= number of dimensions in the tensor (3)"
+    Pyro's Predictive adds a leading sample dimension to every latent
+    variable.  During posterior sampling:
+        alpha → (..., K)
+        W     → (..., P, K)   ← 3-D, so .t() crashes
+        tau   → (...,)
+
+    Fixes applied
+    -------------
+    1. alpha.reshape(-1) → always (K,) before building W_scale.
+    2. W.transpose(-2, -1) instead of W.t() → works for any number of
+       leading dims (2-D or 3-D), transposes last two axes only.
+    3. torch.matmul(f, W.transpose(-2,-1)) instead of torch.mm → mm
+       requires exactly 2-D inputs; matmul broadcasts over batch dims.
     """
     n_obs    = X.shape[0]
     n_assets = X.shape[1]
@@ -37,33 +42,35 @@ def model(X, n_factors):
     alpha = pyro.sample(
         "alpha",
         dist.Gamma(1.0, 1.0).expand([n_factors]).to_event(1)
-    )                                           # declared shape: (K,)
-                                                # but Predictive may pass (1,K)
-
-    # FIX: flatten to (K,) regardless of any leading sample/batch dims added
-    # by AutoDiagonalNormal during the Predictive posterior sweep.
-    alpha_k = alpha.reshape(-1)                 # always (K,)
+    )
+    # Flatten to (K,) regardless of leading sample/batch dims from Predictive
+    alpha_k = alpha.reshape(-1)                     # (K,)
 
     # ── Factor loadings W: (P, K) ─────────────────────────────────────────────
-    # Build scale as (P, K) cleanly from the (K,) alpha_k.
     W_scale = (1.0 / torch.sqrt(alpha_k)).unsqueeze(0).expand(n_assets, n_factors)
     W = pyro.sample(
         "W",
         dist.Normal(torch.zeros(n_assets, n_factors), W_scale).to_event(2)
-    )                                           # (P, K)
+    )                                               # declared (P, K)
+                                                    # Predictive adds (..., P, K)
 
     # ── Observation noise ─────────────────────────────────────────────────────
     tau   = pyro.sample("tau", dist.Gamma(1.0, 1.0))
     sigma = 1.0 / torch.sqrt(tau)
 
-    # ── Factor scores + likelihood — plate name must not match any sample name ─
+    # ── Factor scores + likelihood ────────────────────────────────────────────
     with pyro.plate("time_steps", n_obs):
         f = pyro.sample(
             "f",
             dist.Normal(torch.zeros(n_factors), torch.ones(n_factors)).to_event(1)
-        )                                       # (N, K)
+        )                                           # (N, K)
 
-        mean = torch.mm(f, W.t())              # (N, P)
+        # FIX: use .transpose(-2, -1) instead of .t() so it works when
+        # Predictive injects W as (..., P, K) with leading sample dims.
+        # FIX: use torch.matmul instead of torch.mm — mm requires exactly
+        # 2-D inputs; matmul handles (..., N, K) @ (..., K, P) → (..., N, P).
+        W_T  = W.transpose(-2, -1)                 # (..., K, P)
+        mean = torch.matmul(f, W_T)                # (..., N, P)
 
         pyro.sample(
             "obs",
@@ -80,7 +87,7 @@ def train_svi_model(X, n_factors=5, lr=0.01, iterations=500, batch_size=32):
         X:          np.ndarray (N, P) — standardised returns
         n_factors:  K
         lr:         Adam learning rate
-        iterations: SVI steps
+        iterations: SVI gradient steps
         batch_size: mini-batch rows per step
 
     Returns:
@@ -95,7 +102,6 @@ def train_svi_model(X, n_factors=5, lr=0.01, iterations=500, batch_size=32):
     optimizer = Adam({"lr": lr})
     svi       = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
-    # ── Training ──────────────────────────────────────────────────────────────
     for step in range(iterations):
         idx   = np.random.choice(n_obs, min(batch_size, n_obs), replace=False)
         batch = X_tensor[idx]
@@ -103,13 +109,14 @@ def train_svi_model(X, n_factors=5, lr=0.01, iterations=500, batch_size=32):
         if step % 100 == 0:
             print(f"    Step {step:4d}: ELBO loss = {loss:.4f}")
 
-    # ── Posterior W via Predictive ────────────────────────────────────────────
+    # Posterior W samples using full data
     predictive = Predictive(model, guide=guide, num_samples=200,
                             return_sites=["W"])
     with torch.no_grad():
         posterior = predictive(X_tensor, n_factors)
 
-    # W_samples: (num_samples, P, K)  — mean over samples → (P, K)
-    W_mean = posterior["W"].mean(dim=0).numpy()
-    scores = np.sum(np.abs(W_mean), axis=1)     # (P,)
+    # W_samples: (num_samples, P, K) → mean (P, K) → scores (P,)
+    W_samples = posterior["W"]                      # (200, P, K)
+    W_mean    = W_samples.mean(dim=0).numpy()       # (P, K)
+    scores    = np.sum(np.abs(W_mean), axis=1)      # (P,)
     return scores
